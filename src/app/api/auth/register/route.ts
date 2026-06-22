@@ -5,11 +5,11 @@ import { checkRateLimit } from '@/lib/rate-limit';
 
 export async function POST(request: NextRequest) {
   try {
-    // Rate limit: 3 registration attempts per minute per IP
+    // Rate limit: 30 registration attempts per minute per IP
     const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
       || request.headers.get('x-real-ip')
       || 'unknown';
-    const rateLimit = await checkRateLimit(ip, 'auth/register', 3, 60 * 1000);
+    const rateLimit = await checkRateLimit(ip, 'auth/register', 30, 60 * 1000);
     if (!rateLimit.allowed) {
       return NextResponse.json(
         { success: false, message: 'Too many registration attempts. Please try again later.' },
