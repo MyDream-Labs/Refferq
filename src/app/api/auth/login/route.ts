@@ -1,19 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import * as bcrypt from 'bcryptjs';
-import { SignJWT } from 'jose';
 import { checkRateLimit } from '@/lib/rate-limit';
-
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.JWT_SECRET!
-);
+import { otpService } from '@/lib/otp';
+import { extractRequestIp, isLegacyAuthPayload, normalizeEmail } from '@/lib/auth-flow';
 
 export async function POST(request: NextRequest) {
   try {
     // Rate limit: 5 login attempts per minute per IP
-    const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
-      || request.headers.get('x-real-ip')
-      || 'unknown';
+    const ip = extractRequestIp(request);
     const rateLimit = await checkRateLimit(ip, 'auth/login', 5, 60 * 1000);
     if (!rateLimit.allowed) {
       return NextResponse.json(
@@ -29,77 +23,78 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const body = await request.json();
-    const { email, password } = body;
+    const body = (await request.json()) as Record<string, unknown>;
 
-    // Validate required fields
-    if (!email || !password) {
+    if (isLegacyAuthPayload(body)) {
       return NextResponse.json(
-        { success: false, message: 'Email and password are required' },
+        { success: false, message: 'This endpoint no longer accepts password payloads. Use OTP flow.' },
+        { status: 410 }
+      );
+    }
+
+    const email = normalizeEmail(body.email);
+
+    if (!email) {
+      return NextResponse.json(
+        { success: false, message: 'Email is required' },
+        { status: 400 }
+      );
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return NextResponse.json(
+        { success: false, message: 'Invalid email format' },
         { status: 400 }
       );
     }
 
     // Find user by email
     const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase().trim() }
+      where: { email }
     });
 
     if (!user) {
       return NextResponse.json(
-        { success: false, message: 'Invalid email or password' },
-        { status: 401 }
+        {
+          success: true,
+          next: 'register',
+          message: 'Please continue registration with your email.'
+        },
+        {
+          status: 202,
+        }
       );
     }
 
     // Check user status - use generic message to prevent account status enumeration
-    if (user.status !== 'ACTIVE') {
+    if (user.status === 'INACTIVE' || user.status === 'SUSPENDED') {
       return NextResponse.json(
-        { success: false, message: 'Unable to log in. Please contact support if you need assistance.' },
+        { success: false, message: 'Your account is not active. Please contact support.' },
         { status: 403 }
       );
     }
 
-    // Verify password
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
+    // Existing users get OTP login.
+    const otpResult = await otpService.sendOTP(email, { allowPending: true });
+    if (!otpResult.success) {
       return NextResponse.json(
-        { success: false, message: 'Invalid email or password' },
-        { status: 401 }
+        { success: false, message: otpResult.message },
+        { status: 400 }
       );
     }
 
-    // Generate JWT token
-    const token = await new SignJWT({
-      userId: user.id,
-      email: user.email,
-      role: user.role,
-      name: user.name
-    })
-      .setProtectedHeader({ alg: 'HS256' })
-      .setIssuedAt()
-      .setExpirationTime('24h')
-      .sign(JWT_SECRET);
-
-    // Return user data (password excluded)
-    const { password: _, ...userData } = user;
-
-    const response = NextResponse.json({
-      success: true,
-      message: 'Login successful',
-      user: userData,
-    });
-
-    // Set auth cookie
-    response.cookies.set('auth-token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 86400, // 24 hours
-      path: '/'
-    });
-
-    return response;
+    return NextResponse.json(
+      {
+        success: true,
+        next: 'otp',
+        email,
+        message: otpResult.message,
+      },
+      {
+        status: 202,
+      }
+    );
   } catch (error) {
     console.error('Login API error:', error);
     return NextResponse.json(

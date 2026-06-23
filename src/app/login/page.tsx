@@ -40,7 +40,7 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      const otpRes = await fetch('/api/auth/send-otp', {
+      const otpRes = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email }),
@@ -48,9 +48,15 @@ export default function LoginPage() {
 
       const otpData = await otpRes.json();
 
-      if (otpRes.ok && otpData.success) {
+      if (otpRes.status === 202 && otpData.next === 'otp') {
         setStep('otp');
         setMessage(otpData.message || 'A verification code has been sent to your email.');
+      } else if (otpData.next === 'register') {
+        setError('Email not found. Redirecting to registration.');
+        setMessage(otpData.message || 'Please create an account to continue.');
+        setTimeout(() => {
+          router.push(`/register?email=${encodeURIComponent(email)}`);
+        }, 1200);
       } else {
         setError(otpData.message || 'Failed to send verification code');
       }
@@ -103,7 +109,7 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      const res = await fetch('/api/auth/send-otp', {
+      const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email }),

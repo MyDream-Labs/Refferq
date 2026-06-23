@@ -1,5 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { Prisma } from '@prisma/client';
+import { REFERRAL_STATES, buildReferralStateMetadata } from '@/lib/referral-flow';
+
+type ReferralPayload = {
+  company?: string;
+  notes?: string;
+  estimated_value?: number;
+};
+
+function asReferralPayload(value: unknown): ReferralPayload {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return value as ReferralPayload;
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -58,6 +73,7 @@ export async function POST(request: NextRequest) {
         leadEmail: leadEmail.toLowerCase().trim(),
         status: 'PENDING',
         metadata: {
+          ...buildReferralStateMetadata(undefined, REFERRAL_STATES.LEAD, 'affiliate-referrals-api'),
           company: company || '',
           notes: notes || '',
           source: 'manual',
@@ -121,8 +137,8 @@ export async function GET(request: NextRequest) {
     });
 
     // Map referrals to include estimatedValue from metadata
-    const mappedReferrals = referrals.map((ref: any) => {
-      const metadata = ref.metadata as any;
+    const mappedReferrals = referrals.map((ref) => {
+      const metadata = asReferralPayload(ref.metadata as Prisma.JsonValue);
       return {
         ...ref,
         estimatedValue: Number(metadata?.estimated_value) || 0,

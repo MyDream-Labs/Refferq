@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db, prisma } from '@/lib/prisma';
+import { ConversionType, Prisma } from '@prisma/client';
+import { prisma, db } from '@/lib/prisma';
 import crypto from 'crypto';
+import { type WebhookConversionPayload, webhookConversionSchema } from '@/lib/validations';
+import { z } from 'zod';
+import { getProgramSettings } from '@/lib/program-settings';
 
 // ─── Webhook Signature Verification ────────────────────────────
 function verifyWebhookSignature(payload: string, signature: string | null, secret: string): boolean {
@@ -14,37 +18,114 @@ function verifyWebhookSignature(payload: string, signature: string | null, secre
   }
 }
 
-async function verifyApiKey(request: NextRequest): Promise<boolean> {
-  const apiKey = request.headers.get('x-api-key');
-  if (!apiKey) return false;
+type ApiKeyAuth = {
+  integrationId: string;
+  actorId: string;
+};
 
-  // Hash the incoming key and look up by keyHash for secure comparison
-  const keyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
-  const key = await prisma.apiKey.findFirst({
-    where: { keyHash, isActive: true }
-  }).catch(() => null);
+type WebhookDuplicateConversion = Prisma.ConversionGetPayload<{
+  include: {
+      affiliate: {
+        select: {
+          id: true;
+          referralCode: true;
+          user: {
+            select: {
+              name: true;
+            };
+          };
+        };
+      };
+      commissions: true;
+    };
+  }>;
 
-  return !!key;
+function asJsonObject(value: unknown): Prisma.InputJsonObject {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Prisma.InputJsonObject;
+  }
+  return {};
+}
+
+async function verifyApiKey(request: NextRequest): Promise<ApiKeyAuth | null> {
+  const apiKeyHeader = request.headers.get('x-api-key');
+  if (!apiKeyHeader) return null;
+
+  const keyHash = crypto.createHash('sha256').update(apiKeyHeader).digest('hex');
+  const key = await prisma.apiKey.findFirst({ where: { keyHash, isActive: true } });
+  if (!key) return null;
+
+  return {
+    integrationId: key.id,
+    actorId: key.userId,
+  };
+}
+
+function extractIdempotencyKey(request: NextRequest, body: { eventId?: string; order_id?: string }) {
+  const headerValue = request.headers.get('X-Idempotency-Key') || request.headers.get('x-idempotency-key');
+  return headerValue?.trim() || body.eventId?.trim() || body.order_id?.trim() || null;
+}
+
+async function findDuplicateConversion(
+  integrationId: string,
+  eventType: ConversionType,
+  idempotencyKey: string
+): Promise<WebhookDuplicateConversion | null> {
+  return prisma.conversion.findFirst({
+    where: {
+      eventType,
+      AND: [
+        { eventMetadata: { path: ['integrationId'], equals: integrationId } },
+        { eventMetadata: { path: ['idempotencyKey'], equals: idempotencyKey } },
+        { eventMetadata: { path: ['source'], equals: 'WEBHOOK_CONVERSION' } },
+      ],
+    },
+    include: {
+      affiliate: {
+        select: {
+          id: true,
+          referralCode: true,
+          user: {
+            select: { name: true },
+          },
+        },
+      },
+      commissions: true,
+    },
+  });
+}
+
+function toNumberCents(data: z.infer<typeof webhookConversionSchema>) {
+  if (data.amount_cents !== undefined) return Math.trunc(data.amount_cents);
+  return Math.max(0, Math.round((data.amount ?? 0) * 100));
+}
+
+function normalizeEventMetadata(metadata: WebhookConversionPayload['event_metadata']) {
+  return asJsonObject(metadata);
 }
 
 export async function POST(request: NextRequest) {
   try {
-    // ─── Authentication: Require API key OR webhook signature ───
     const rawBody = await request.text();
     const webhookSecret = process.env.WEBHOOK_SECRET;
     const signature = request.headers.get('x-webhook-signature') || request.headers.get('x-refferq-signature');
 
     let authenticated = false;
+    let actorId: string | null = null;
+    let integrationId = 'WEBHOOK_SIGNATURE';
 
-    // Method 1: API key authentication
-    const apiKey = request.headers.get('x-api-key');
-    if (apiKey) {
-      authenticated = await verifyApiKey(request);
+    const apiKeyAuth = await verifyApiKey(request);
+    if (apiKeyAuth) {
+      authenticated = true;
+      actorId = apiKeyAuth.actorId;
+      integrationId = apiKeyAuth.integrationId;
     }
 
-    // Method 2: Webhook signature verification
     if (!authenticated && webhookSecret && signature) {
       authenticated = verifyWebhookSignature(rawBody, signature, webhookSecret);
+      if (authenticated && !actorId) {
+        integrationId = 'WEBHOOK_SIGNATURE';
+      }
     }
 
     if (!authenticated) {
@@ -54,52 +135,90 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const body = JSON.parse(rawBody);
-    const {
-      event_type,
-      amount_cents,
-      currency = 'USD',
-      customer_email,
-      attribution_key,
-      referral_code,
-      event_metadata = {},
-    } = body;
-
-    // Validate required fields
-    if (!event_type || !customer_email) {
+    let parsedBody: unknown;
+    try {
+      parsedBody = JSON.parse(rawBody);
+    } catch (_error) {
       return NextResponse.json(
-        { success: false, message: 'Event type and customer email are required' },
+        { success: false, message: 'Invalid JSON payload' },
         { status: 400 }
       );
+    }
+
+    const validation = webhookConversionSchema.safeParse(parsedBody);
+    if (!validation.success) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: 'Invalid payload',
+          details: validation.error.flatten(),
+        },
+        { status: 400 }
+      );
+    }
+
+    const data = validation.data;
+    const idempotencyKey = extractIdempotencyKey(request, data);
+    const amountCents = toNumberCents(data);
+    const customerEmail = data.customer_email;
+    const referralCode = data.referral_code;
+    const attributionKey = data.attribution_key;
+    const eventType = data.event_type;
+    const amount = amountCents;
+    const currency = data.currency;
+
+    if (!idempotencyKey) {
+      return NextResponse.json(
+        { success: false, message: 'eventId or order_id is required when X-Idempotency-Key is not provided' },
+        { status: 400 }
+      );
+    }
+
+    const duplicate = await findDuplicateConversion(integrationId, eventType, idempotencyKey);
+
+    if (duplicate) {
+      const existingCommission = duplicate.commissions.at(0);
+      return NextResponse.json({
+        success: true,
+        duplicate: true,
+        message: 'Webhook conversion already processed',
+        attributed: true,
+        conversion: {
+          id: duplicate.id,
+          amount: duplicate.amountCents / 100,
+          currency: duplicate.currency,
+          status: duplicate.status,
+          createdAt: duplicate.createdAt,
+        },
+        commission: existingCommission
+          ? {
+              id: existingCommission.id,
+              amount: existingCommission.amountCents / 100,
+              status: existingCommission.status,
+            }
+          : null,
+        affiliate: {
+          id: duplicate.affiliate.id,
+          code: duplicate.affiliate.referralCode,
+          name: duplicate.affiliate.user.name,
+        },
+      });
     }
 
     let affiliate = null;
     let attributionMethod = 'none';
 
-    // Try to find affiliate through attribution key first
-    if (attribution_key) {
-      // In a real implementation, this would be stored in Redis
-      // For this simulation, we'll comment out the problematic call
-      // const recentClicks = await db.getClicksByReferralId('some-referral-id');
-      // For demo purposes, we'll use referral_code method
+    // Attribution by attribution key is not implemented yet and can be enhanced later.
+    if (attributionKey) {
       attributionMethod = 'attribution_key';
     }
 
-    // Fallback to referral code
-    if (!affiliate && referral_code) {
-      affiliate = await db.getAffiliateByReferralCode(referral_code);
+    if (!affiliate && referralCode) {
+      affiliate = await db.getAffiliateByReferralCode(referralCode);
       attributionMethod = 'referral_code';
     }
 
-    // If no affiliate found, log the conversion but don't create commission
     if (!affiliate) {
-      console.log('Conversion received but no affiliate attribution found:', {
-        event_type,
-        customer_email,
-        attribution_key,
-        referral_code,
-      });
-
       return NextResponse.json({
         success: true,
         message: 'Conversion logged (no attribution)',
@@ -107,79 +226,104 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Create conversion record
-    const conversion = await db.createConversion({
-      affiliateId: affiliate.id,
-      eventType: event_type,
-      amountCents: amount_cents || 0,
-      currency,
-      eventMetadata: {
-        ...event_metadata,
-        customerEmail: customer_email,
-        attributionMethod,
-        attributionKey: attribution_key,
-        referralCode: referral_code,
-      },
-    });
+    const settings = await getProgramSettings();
+    const holdDays = settings.commissionHoldDays;
 
-    // Calculate commission
-    const commissionRules = await db.getCommissionRules();
-    let applicableRule = commissionRules.find((rule: any) => rule.isDefault);
+    const commissionRules = await prisma.commissionRule.findMany();
+    const applicableRule = commissionRules.find((rule) => rule.isDefault) ?? commissionRules.find((rule) => rule.type === 'PERCENTAGE');
 
-    const commissionRate = applicableRule?.value || 15;
-    let commissionAmount = 0;
+    const rate = applicableRule?.value ?? 15;
+    const commissionRate = applicableRule?.type === 'FIXED' ? rate : rate;
 
-    if (applicableRule?.type === 'PERCENTAGE' && amount_cents) {
-      commissionAmount = Math.floor((amount_cents * commissionRate) / 100);
-    } else if (applicableRule?.type === 'FIXED') {
-      commissionAmount = commissionRate;
-    }
+    const commissionAmount =
+      applicableRule?.type === 'FIXED'
+        ? Math.trunc(commissionRate)
+        : Math.floor((amount * commissionRate) / 100);
 
-    // ─── Commission Hold Period ─────────────────────────────────
-    // Fetch hold days from ProgramSettings (default 30)
-    const settings = await prisma.programSettings.findFirst();
-    const holdDays = (settings as any)?.commissionHoldDays ?? 30;
     const maturesAt = new Date();
     maturesAt.setDate(maturesAt.getDate() + holdDays);
 
-    // Create commission record with maturesAt (status stays PENDING until maturation)
-    const commission = await prisma.commission.create({
-      data: {
-        conversionId: conversion.id,
-        affiliateId: affiliate.id,
-        userId: affiliate.userId,
-        amountCents: commissionAmount,
-        rate: commissionRate,
-        status: 'PENDING',
-        maturesAt,
-      },
-    });
+    const result = await prisma.$transaction(async (tx) => {
+      const conversion = await tx.conversion.create({
+        data: {
+          affiliateId: affiliate.id,
+          eventType,
+          amountCents: amount,
+          currency,
+          status: 'PENDING',
+          eventMetadata: {
+            ...normalizeEventMetadata(data.event_metadata),
+            customerEmail,
+            attributionMethod,
+            attributionKey,
+            referralCode,
+            idempotencyKey,
+            integrationId,
+            source: 'WEBHOOK_CONVERSION',
+            eventId: data.eventId,
+            orderId: data.order_id,
+          },
+        },
+      });
 
-    // NOTE: We do NOT update balanceCents here anymore.
-    // Balance is only updated when the commission matures (PENDING → APPROVED).
-    // This protects against refunds during the hold period.
+      const commission = await tx.commission.create({
+        data: {
+          conversionId: conversion.id,
+          affiliateId: affiliate.id,
+          userId: affiliate.userId,
+          amountCents: commissionAmount,
+          rate: commissionRate,
+          status: 'PENDING',
+          maturesAt,
+        },
+      });
 
-    // Log audit event
-    await db.createAuditLog({
-      actorId: 'system',
-      action: 'conversion_tracked',
-      objectType: 'conversion',
-      objectId: conversion.id,
-      payload: {
-        event_type,
-        amount_cents,
-        commission_amount: commissionAmount,
-        affiliate_id: affiliate.id,
-        attributionMethod,
-      },
+      if (actorId) {
+        try {
+          await tx.auditLog.create({
+            data: {
+              actorId,
+              action: 'conversion_tracked',
+              objectType: 'conversion',
+              objectId: conversion.id,
+              payload: {
+                source: 'webhook',
+                event_type: eventType,
+                amount_cents: amount,
+                commission_amount: commissionAmount,
+                affiliate_id: affiliate.id,
+                attributionMethod,
+                idempotencyKey,
+              },
+            },
+          });
+        } catch (_error) {
+          // Audit failures must not impact main processing path.
+        }
+      }
+
+      return { conversion, commission };
     });
 
     return NextResponse.json({
       success: true,
       message: 'Conversion tracked successfully',
       attributed: true,
-      conversion,
-      commission,
+      idempotency: {
+        key: idempotencyKey,
+        integrationId,
+      },
+      conversion: {
+        id: result.conversion.id,
+        amount: result.conversion.amountCents / 100,
+        currency: result.conversion.currency,
+        status: result.conversion.status,
+      },
+      commission: {
+        id: result.commission.id,
+        amount: result.commission.amountCents / 100,
+        status: result.commission.status,
+      },
       attributionMethod,
     });
   } catch (error) {

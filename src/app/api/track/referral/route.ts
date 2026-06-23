@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { trackReferralSchema } from '@/lib/validations';
 
 /**
  * POST /api/track/referral - Track referral clicks
@@ -31,14 +32,27 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { referralCode, url, referrer, userAgent, timestamp } = body;
+    const validation = trackReferralSchema.safeParse(body);
 
-    if (!referralCode) {
+    if (!validation.success) {
       return NextResponse.json(
-        { success: false, error: 'Referral code is required' },
+        {
+          success: false,
+          error: 'Invalid payload',
+          details: validation.error.flatten(),
+        },
         { status: 400 }
       );
     }
+
+    const {
+      referralCode,
+      url,
+      referrer,
+      userAgent,
+      timestamp,
+      metadata,
+    } = validation.data;
 
     // Find affiliate by referral code
     const affiliate = await prisma.affiliate.findUnique({
@@ -76,6 +90,7 @@ export async function POST(req: NextRequest) {
       url,
       referrer,
       timestamp,
+      metadata,
     });
 
     // You can optionally create a ReferralClick record or update stats

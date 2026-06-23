@@ -28,8 +28,7 @@ POST /api/auth/register
 ```json
 {
   "name": "John Doe",
-  "email": "john@example.com",
-  "password": "securePassword123"
+  "email": "john@example.com"
 }
 ```
 
@@ -37,15 +36,22 @@ POST /api/auth/register
 ```json
 {
   "success": true,
-  "message": "Registration successful",
+  "next": "otp",
+  "email": "john@example.com",
+  "message": "OTP sent successfully",
   "user": {
     "id": "user_id",
     "name": "John Doe",
     "email": "john@example.com",
-    "role": "AFFILIATE"
+    "role": "AFFILIATE",
+    "status": "PENDING"
   }
 }
 ```
+
+**Notes**
+- `password` больше не принимается. Любой payload с полями для пароля должен возвращать `410 Gone`.
+- Для существующего пользователя с активным/pending статусом `register` возвращает тот же `next: "otp"` и отправляет код.
 
 ### Login
 
@@ -56,8 +62,7 @@ POST /api/auth/login
 **Request Body:**
 ```json
 {
-  "email": "john@example.com",
-  "password": "securePassword123"
+  "email": "john@example.com"
 }
 ```
 
@@ -65,15 +70,15 @@ POST /api/auth/login
 ```json
 {
   "success": true,
-  "user": {
-    "id": "user_id",
-    "name": "John Doe",
-    "email": "john@example.com",
-    "role": "AFFILIATE",
-    "hasAffiliate": true
-  }
+  "next": "otp",
+  "email": "john@example.com",
+  "message": "OTP sent successfully"
 }
 ```
+
+**Notes**
+- Если email не найден, API возвращает `next: "register"` с `202 Accepted` (без отправки OTP), чтобы не раскрывать наличие аккаунта.
+- Любые попытки передать `password` — `410 Gone`.
 
 ### Logout
 
@@ -482,7 +487,7 @@ GET /api/affiliate/payouts
 - `No authentication token` - User not logged in
 - `Admin access required` - User is not admin
 - `Affiliate role required` - User is not affiliate
-- `Invalid credentials` - Wrong email/password
+- `OTP flow` - Passwordless auth uses email + OTP
 - `User not found` - User doesn't exist
 - `Email already in use` - Email taken during registration
 

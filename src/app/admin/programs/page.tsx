@@ -155,7 +155,7 @@ export default function ProgramsPage() {
   };
 
   const formatCurrency = (cents: number, currency: string = 'INR') => {
-    const symbol = currency === 'INR' ? '\u20B9' : currency === 'USD' ? '$' : currency === 'EUR' ? '\u20AC' : currency;
+    const symbol = currency === 'INR' ? '$' : currency === 'USD' ? '$' : currency === 'EUR' ? '\u20AC' : currency;
     return `${symbol}${(cents / 100).toLocaleString('en-IN', { minimumFractionDigits: 0 })}`;
   };
 
@@ -350,7 +350,7 @@ export default function ProgramsPage() {
                 <Select value={form.currency} onValueChange={v => setForm({...form, currency: v})}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="INR">INR (\u20B9)</SelectItem>
+                    <SelectItem value="INR">INR ($)</SelectItem>
                     <SelectItem value="USD">USD ($)</SelectItem>
                     <SelectItem value="EUR">EUR (\u20AC)</SelectItem>
                     <SelectItem value="GBP">GBP (\u00A3)</SelectItem>

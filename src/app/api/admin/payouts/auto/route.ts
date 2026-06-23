@@ -1,13 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { UserStatus } from '@prisma/client';
+import { getProgramSettings } from '@/lib/program-settings';
 
 
 async function verifyAdmin(request: NextRequest) {
   try {
     const userId = request.headers.get('x-user-id');
     if (!userId) return null;
-    const user = await prisma.user.findUnique({ where: { id: userId } });
-    if (!user || user.role !== 'ADMIN') return null;
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, role: true, status: true }
+    });
+    if (!user || user.role !== 'ADMIN' || user.status !== UserStatus.ACTIVE) return null;
     return user;
   } catch (_e) { return null; }
 }
@@ -22,21 +27,68 @@ export async function POST(request: NextRequest) {
   try {
     const { dryRun = false } = await request.json().catch(() => ({ dryRun: false }));
 
-    // Get program settings for min payout threshold
-    const settings = await prisma.programSettings.findFirst();
-    const minPayoutCents = settings?.minPayoutCents || 100000; // Default ₹1000
+    const settings = await getProgramSettings();
+    const minPayoutCents = settings.minPayoutCents;
 
-    // Find all affiliates with balance above minimum payout threshold
+    // Find eligible commissions for payout by affiliate, scoped by payout threshold.
     // Status check is on User model, not Affiliate
-    const eligibleAffiliates = await prisma.affiliate.findMany({
+    const eligibleCommissions = await prisma.commission.findMany({
       where: {
-        balanceCents: { gte: minPayoutCents },
-        user: { status: 'ACTIVE' },
+        status: 'APPROVED',
+        payoutId: null,
+        affiliate: {
+          user: {
+            status: UserStatus.ACTIVE,
+          },
+        },
       },
       include: {
-        user: { select: { id: true, name: true, email: true } },
+        affiliate: {
+          select: {
+            id: true,
+            user: {
+              select: {
+                name: true,
+                email: true,
+              },
+            },
+          },
+        },
       },
     });
+
+    const commissionsByAffiliate = new Map<
+      string,
+      {
+        affiliateId: string;
+        affiliateUserId: string;
+        affiliateName: string | null;
+        affiliateEmail: string | null;
+        totalAmountCents: number;
+        commissionIds: string[];
+      }
+    >();
+
+    for (const commission of eligibleCommissions) {
+      const item = commissionsByAffiliate.get(commission.affiliateId);
+      if (!item) {
+        commissionsByAffiliate.set(commission.affiliateId, {
+          affiliateId: commission.affiliateId,
+          affiliateUserId: commission.userId,
+          affiliateName: commission.affiliate.user?.name || null,
+          affiliateEmail: commission.affiliate.user?.email || null,
+          totalAmountCents: commission.amountCents,
+          commissionIds: [commission.id],
+        });
+      } else {
+        item.totalAmountCents += commission.amountCents;
+        item.commissionIds.push(commission.id);
+      }
+    }
+
+    const eligibleAffiliates = Array.from(commissionsByAffiliate.values()).filter(
+      (entry) => entry.totalAmountCents >= minPayoutCents,
+    );
 
     if (eligibleAffiliates.length === 0) {
       return NextResponse.json({
@@ -52,13 +104,14 @@ export async function POST(request: NextRequest) {
         success: true,
         dryRun: true,
         eligible: eligibleAffiliates.map(a => ({
-          id: a.id,
-          name: a.user.name,
-          email: a.user.email,
-          balanceCents: a.balanceCents,
+          affiliateId: a.affiliateId,
+          name: a.affiliateName,
+          email: a.affiliateEmail,
+          payoutCents: a.totalAmountCents,
+          commissions: a.commissionIds.length,
         })),
         totalAffiliates: eligibleAffiliates.length,
-        totalAmountCents: eligibleAffiliates.reduce((s, a) => s + a.balanceCents, 0),
+        totalAmountCents: eligibleAffiliates.reduce((s, a) => s + a.totalAmountCents, 0),
       });
     }
 
@@ -76,46 +129,89 @@ export async function POST(request: NextRequest) {
 
     for (const affiliate of eligibleAffiliates) {
       try {
-        const payoutAmountCents = affiliate.balanceCents;
+        const payoutAmountCents = affiliate.totalAmountCents;
 
-        // Create payout record
-        const payout = await prisma.payout.create({
-          data: {
-            affiliateId: affiliate.id,
-            userId: affiliate.user.id,
-            amountCents: payoutAmountCents,
-            status: 'PENDING',
-            method: 'AUTO',
-            notes: 'Auto-payout processed',
-            createdBy: admin.id,
-          },
-        });
-
-        // Reset affiliate balance
-        await prisma.affiliate.update({
-          where: { id: affiliate.id },
-          data: {
-            balanceCents: 0,
-          },
-        });
-
-        // Create audit log
-        await prisma.auditLog.create({
-          data: {
-            action: 'AUTO_PAYOUT_CREATED',
-            actorId: admin.id,
-            objectType: 'payout',
-            objectId: payout.id,
-            payload: {
-              affiliateId: affiliate.id,
-              amountCents: payoutAmountCents,
+        const payout = await prisma.$transaction(async (tx) => {
+          const commissions = await tx.commission.findMany({
+            where: {
+              id: { in: affiliate.commissionIds },
+              status: 'APPROVED',
+              payoutId: null,
             },
-          },
+          });
+
+          if (commissions.length === 0) {
+            throw new Error('No qualifying commissions remained for payout.');
+          }
+
+          const amountCents = commissions.reduce((sum, item) => sum + item.amountCents, 0);
+
+          if (amountCents !== payoutAmountCents) {
+            throw new Error('Payout amount changed during processing.');
+          }
+
+          const createdPayout = await tx.payout.create({
+            data: {
+              affiliateId: affiliate.affiliateId,
+              userId: affiliate.affiliateUserId,
+              amountCents,
+              status: 'PENDING',
+              method: 'AUTO',
+              notes: 'Auto-payout processed',
+              createdBy: admin.id,
+            },
+          });
+
+          const balanceUpdate = await tx.affiliate.updateMany({
+            where: {
+              id: affiliate.affiliateId,
+              balanceCents: payoutAmountCents,
+            },
+            data: {
+              balanceCents: 0,
+            },
+          });
+
+          if (balanceUpdate.count !== 1) {
+            throw new Error('Affiliate balance changed during processing');
+          }
+
+          const commissionUpdate = await tx.commission.updateMany({
+            where: {
+              id: { in: commissions.map((entry) => entry.id) },
+              payoutId: null,
+              status: 'APPROVED',
+            },
+            data: {
+              status: 'PAID',
+              payoutId: createdPayout.id,
+              paidAt: new Date(),
+            },
+          });
+
+          if (commissionUpdate.count !== commissions.length) {
+            throw new Error('Commission payout state changed before commit.');
+          }
+
+          await tx.auditLog.create({
+            data: {
+              action: 'AUTO_PAYOUT_CREATED',
+              actorId: admin.id,
+              objectType: 'payout',
+              objectId: createdPayout.id,
+              payload: {
+                affiliateId: affiliate.affiliateId,
+                amountCents: payoutAmountCents,
+              },
+            },
+          });
+
+          return createdPayout;
         });
 
         results.push({
-          affiliateId: affiliate.id,
-          name: affiliate.user.name,
+          affiliateId: affiliate.affiliateId,
+          name: affiliate.affiliateName || 'Unknown',
           payoutId: payout.id,
           amountCents: payoutAmountCents,
           status: 'CREATED',
@@ -125,8 +221,8 @@ export async function POST(request: NextRequest) {
         totalAmountCents += payoutAmountCents;
       } catch (err) {
         results.push({
-          affiliateId: affiliate.id,
-          name: affiliate.user.name,
+          affiliateId: affiliate.affiliateId,
+          name: affiliate.affiliateName || 'Unknown',
           status: 'FAILED',
           error: (err as Error).message,
         });
@@ -154,24 +250,28 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const settings = await prisma.programSettings.findFirst();
+    const settings = await getProgramSettings();
 
-    // Count eligible affiliates
-    const minPayoutCents = settings?.minPayoutCents || 100000;
-    const eligibleCount = await prisma.affiliate.count({
+    const minPayoutCents = settings.minPayoutCents;
+    const eligibleCommissions = await prisma.commission.findMany({
       where: {
-        balanceCents: { gte: minPayoutCents },
-        user: { status: 'ACTIVE' },
+        status: 'APPROVED',
+        payoutId: null,
+        affiliate: {
+          user: { status: UserStatus.ACTIVE },
+        },
       },
+      select: { affiliateId: true, amountCents: true },
     });
 
-    const totalPendingBalance = await prisma.affiliate.aggregate({
-      where: {
-        balanceCents: { gte: minPayoutCents },
-        user: { status: 'ACTIVE' },
-      },
-      _sum: { balanceCents: true },
-    });
+    const eligibleByAffiliate = new Map<string, number>();
+    for (const commission of eligibleCommissions) {
+      const prev = eligibleByAffiliate.get(commission.affiliateId) || 0;
+      eligibleByAffiliate.set(commission.affiliateId, prev + commission.amountCents);
+    }
+    const eligibleTotals = Array.from(eligibleByAffiliate.values()).filter((amount) => amount >= minPayoutCents);
+    const eligibleCount = eligibleTotals.length;
+    const totalPendingAmount = eligibleTotals.reduce((acc, amount) => acc + amount, 0);
 
     // Recent auto-payouts
     const recentPayouts = await prisma.payout.findMany({
@@ -189,12 +289,12 @@ export async function GET(request: NextRequest) {
       success: true,
       config: {
         minPayoutCents,
-        payoutFrequency: settings?.payoutFrequency || 'MONTHLY',
-        autoPayoutsEnabled: settings?.autoApprovePayouts || false,
+        payoutFrequency: settings.payoutFrequency,
+        autoPayoutsEnabled: settings.autoApprovePayouts,
       },
       stats: {
         eligibleAffiliates: eligibleCount,
-        totalPendingCents: totalPendingBalance._sum?.balanceCents || 0,
+        totalPendingCents: totalPendingAmount,
       },
       recentPayouts,
     });

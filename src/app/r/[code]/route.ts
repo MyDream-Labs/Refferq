@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import {
+  REFERRAL_STATES,
+  buildReferralStateMetadata,
+  getReferralFlowState,
+  resolveReferralStateTransition,
+} from '@/lib/referral-flow';
 
 // ─── Open Redirect Protection ─────────────────────────────────
 function isAllowedRedirectUrl(url: string, appUrl: string, websiteUrl?: string): boolean {
@@ -101,12 +107,29 @@ export async function GET(
           leadEmail: `click-${attributionKey}@tracking.internal`,
           status: 'PENDING',
           metadata: {
+            ...buildReferralStateMetadata(undefined, REFERRAL_STATES.CLICK, 'r-route'),
             source: 'referral_link',
             attribution_key: attributionKey,
             target_url: targetUrl,
             params: Object.fromEntries(searchParams.entries()),
           }
         }
+      });
+    } else {
+      const nextState = resolveReferralStateTransition(
+        getReferralFlowState(referral.metadata),
+        REFERRAL_STATES.CLICK,
+      );
+
+      referral = await prisma.referral.update({
+        where: { id: referral.id },
+        data: {
+          metadata: buildReferralStateMetadata(
+            referral.metadata,
+            nextState,
+            'r-route',
+          ),
+        },
       });
     }
 
@@ -118,6 +141,7 @@ export async function GET(
         userAgent: userAgent,
         referer: referer,
         metadata: {
+          state: REFERRAL_STATES.CLICK,
           attribution_key: attributionKey,
           target_url: targetUrl,
           is_deep_link: !!searchParams.get('dest'),

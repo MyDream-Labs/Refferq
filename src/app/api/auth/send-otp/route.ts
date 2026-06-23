@@ -1,13 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { otpService } from '@/lib/otp';
 import { checkRateLimit } from '@/lib/rate-limit';
+import { extractRequestIp, isLegacyAuthPayload, normalizeEmail } from '@/lib/auth-flow';
 
 export async function POST(request: NextRequest) {
   try {
     // Rate limit: 3 OTP sends per minute per IP
-    const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
-      || request.headers.get('x-real-ip')
-      || 'unknown';
+    const ip = extractRequestIp(request);
     const rateLimit = await checkRateLimit(ip, 'auth/send-otp', 3, 60 * 1000);
     if (!rateLimit.allowed) {
       return NextResponse.json(
@@ -16,7 +15,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const { email } = await request.json();
+    const body = await request.json() as Record<string, unknown>;
+
+    if (isLegacyAuthPayload(body) || typeof body.code === 'string') {
+      return NextResponse.json(
+        { error: 'Legacy payload rejected' },
+        { status: 410 }
+      );
+    }
+
+    const email = normalizeEmail(body.email);
 
     if (!email) {
       return NextResponse.json(
@@ -34,7 +42,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const result = await otpService.sendOTP(email);
+    const result = await otpService.sendOTP(email, { allowPending: true });
 
     if (!result.success) {
       return NextResponse.json(

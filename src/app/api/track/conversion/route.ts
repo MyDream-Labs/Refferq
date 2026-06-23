@@ -1,5 +1,152 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { ConversionType, Prisma } from '@prisma/client';
 import { prisma } from '@/lib/prisma';
+import { REFERRAL_STATES, buildReferralStateMetadata, getReferralFlowState, resolveReferralStateTransition } from '@/lib/referral-flow';
+import { type TrackConversionPayload, trackConversionSchema } from '@/lib/validations';
+
+type ConversionTrackingResult = {
+  id: string;
+  amountCents: number;
+  currency: string;
+  status: string;
+  createdAt: Date;
+  affiliate: {
+    referralCode: string;
+    user: {
+      name: string;
+    };
+  };
+};
+
+type TrackDuplicateConversion = Prisma.ConversionGetPayload<{
+  include: {
+    affiliate: {
+      select: {
+        referralCode: true;
+        user: {
+          select: {
+            name: true;
+          };
+        };
+      };
+    };
+  };
+}>;
+
+function asJsonObject(value: unknown): Prisma.InputJsonObject {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Prisma.InputJsonObject;
+  }
+  return {};
+}
+
+function parseAmountToCents(amount?: number, amountCents?: number): number {
+  if (amountCents !== undefined) {
+    return Math.max(0, Math.trunc(amountCents));
+  }
+
+  if (amount === undefined) {
+    return 0;
+  }
+
+  return Math.max(0, Math.round(amount * 100));
+}
+
+function extractIdempotencyKey(
+  req: NextRequest,
+  body: { orderId?: string; eventId?: string }
+): string | null {
+  const headerValue = req.headers.get('X-Idempotency-Key') || req.headers.get('x-idempotency-key');
+  if (headerValue?.trim()) return headerValue.trim();
+  if (body.eventId?.trim()) return body.eventId.trim();
+  return body.orderId?.trim() || null;
+}
+
+function toTrackResult(conversion: ConversionTrackingResult) {
+  return {
+    id: conversion.id,
+    amount: conversion.amountCents / 100,
+    currency: conversion.currency,
+    status: conversion.status,
+    createdAt: conversion.createdAt.toISOString(),
+  };
+}
+
+async function findDuplicateConversion(
+  integrationId: string,
+  idempotencyKey: string,
+  eventType: ConversionType
+): Promise<TrackDuplicateConversion | null> {
+  return prisma.conversion.findFirst({
+    where: {
+      eventType,
+      AND: [
+        {
+          eventMetadata: {
+            path: ['idempotencyKey'],
+            equals: idempotencyKey,
+          },
+        },
+        {
+          eventMetadata: {
+            path: ['integrationId'],
+            equals: integrationId,
+          },
+        },
+        {
+          eventMetadata: {
+            path: ['source'],
+            equals: 'TRACK_CONVERSION',
+          },
+        },
+      ],
+    },
+    include: {
+      affiliate: {
+        select: {
+          referralCode: true,
+          user: {
+            select: {
+              name: true,
+            },
+          },
+        },
+      },
+    },
+  });
+}
+
+function normalizeMetadata(metadata: TrackConversionPayload['metadata']): Prisma.InputJsonObject {
+  return asJsonObject(metadata);
+}
+
+function buildConversionMetadata(
+  metadata: TrackConversionPayload['metadata'],
+  idempotencyKey: string,
+  integrationId: string,
+  eventType: string,
+  eventId?: string,
+  orderId?: string,
+  url?: string,
+  timestamp?: string,
+) {
+  const baseMetadata = {
+    ...normalizeMetadata(metadata),
+    orderId: orderId || null,
+    idempotencyKey,
+    integrationId,
+    source: 'TRACK_CONVERSION',
+    eventId,
+    url: url || null,
+    timestamp: timestamp || new Date().toISOString(),
+  };
+
+  return {
+    ...baseMetadata,
+    _trackFlowState: REFERRAL_STATES.CONVERSION,
+    _trackFlowUpdatedAt: new Date().toISOString(),
+  };
+}
 
 /**
  * POST /api/track/conversion - Track conversions/sales
@@ -31,23 +178,56 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
+    const validation = trackConversionSchema.safeParse(body);
+
+    if (!validation.success) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: 'Invalid payload',
+          details: validation.error.flatten(),
+        },
+        { status: 400 }
+      );
+    }
+
     const {
       referralCode,
       customerEmail,
       customerName,
       amount,
+      amountCents,
       currency,
+      eventType,
       orderId,
+      eventId,
       metadata,
       url,
       timestamp,
-    } = body;
+    } = validation.data;
 
-    if (!referralCode) {
+    const idempotencyKey = extractIdempotencyKey(req, { orderId, eventId });
+
+    if (!idempotencyKey) {
       return NextResponse.json(
-        { success: false, error: 'Referral code is required' },
+        { success: false, error: 'eventId or X-Idempotency-Key required when orderId is absent' },
         { status: 400 }
       );
+    }
+
+    const duplicateConversion = await findDuplicateConversion(integration.id, idempotencyKey, eventType);
+
+    if (duplicateConversion) {
+      return NextResponse.json({
+        success: true,
+        duplicate: true,
+        message: 'Conversion already processed',
+        conversion: toTrackResult(duplicateConversion),
+        affiliate: {
+          name: duplicateConversion.affiliate.user.name,
+          code: duplicateConversion.affiliate.referralCode,
+        },
+      });
     }
 
     // Find affiliate by referral code
@@ -92,45 +272,82 @@ export async function POST(req: NextRequest) {
 
     // Create referral if doesn't exist
     if (!referral && customerEmail) {
+      const normalizedMetadata = normalizeMetadata(metadata);
       referral = await prisma.referral.create({
         data: {
           leadEmail: customerEmail,
           leadName: customerName || 'Unknown Customer',
           affiliateId: affiliate.id,
           status: 'APPROVED',
-          metadata: metadata || {},
+          metadata: buildReferralStateMetadata(
+            normalizedMetadata,
+            REFERRAL_STATES.CONVERSION,
+            'track-conversion-create',
+          ),
         },
       });
     } else if (referral && referral.status === 'PENDING') {
+      const referralNextState = resolveReferralStateTransition(
+        getReferralFlowState(referral.metadata),
+        REFERRAL_STATES.CONVERSION,
+      );
+
       // Update referral status to APPROVED
       referral = await prisma.referral.update({
         where: { id: referral.id },
         data: {
           status: 'APPROVED',
-          metadata: {
-            ...(referral.metadata as object),
-            ...metadata,
-          },
+          metadata: buildReferralStateMetadata(
+            {
+              ...asJsonObject(referral.metadata),
+              ...normalizeMetadata(metadata),
+            },
+            referralNextState,
+            'track-conversion-update',
+          ),
+        },
+      });
+    } else if (referral) {
+      referral = await prisma.referral.update({
+        where: { id: referral.id },
+        data: {
+          metadata: buildReferralStateMetadata(
+            {
+              ...asJsonObject(referral.metadata),
+              ...normalizeMetadata(metadata),
+            },
+            resolveReferralStateTransition(
+              getReferralFlowState(referral.metadata),
+              REFERRAL_STATES.CONVERSION,
+            ),
+            'track-conversion-existing',
+          ),
         },
       });
     }
 
     // Create conversion record
-    const amountCents = Math.round((amount || 0) * 100);
+    const resolvedAmountCents = parseAmountToCents(amount, amountCents);
 
     const conversion = await prisma.conversion.create({
       data: {
         affiliateId: affiliate.id,
         referralId: referral?.id || null,
-        eventType: 'PURCHASE',
-        amountCents,
-        currency: currency || 'USD',
+        eventType,
+        amountCents: resolvedAmountCents,
+        currency,
         status: 'PENDING',
         eventMetadata: {
-          orderId: orderId || null,
-          url: url || null,
-          timestamp: timestamp || new Date().toISOString(),
-          ...metadata,
+          ...buildConversionMetadata(
+            metadata,
+            idempotencyKey,
+            integration.id,
+            eventType,
+            eventId,
+            orderId,
+            url,
+            timestamp,
+          ),
         },
       },
     });
@@ -142,7 +359,7 @@ export async function POST(req: NextRequest) {
       conversionId: conversion.id,
       affiliateId: affiliate.id,
       referralId: referral?.id,
-      amount: amountCents / 100,
+      amount: conversion.amountCents / 100,
     });
 
     return NextResponse.json({
@@ -150,12 +367,15 @@ export async function POST(req: NextRequest) {
       message: 'Conversion tracked successfully',
       conversion: {
         id: conversion.id,
-        amount: amountCents / 100,
+        amount: conversion.amountCents / 100,
         currency: conversion.currency,
       },
       affiliate: {
         name: affiliate.user.name,
         code: affiliate.referralCode,
+      },
+      idempotency: {
+        key: idempotencyKey,
       },
     });
   } catch (error) {

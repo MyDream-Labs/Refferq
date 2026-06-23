@@ -26,14 +26,29 @@ export async function GET(request: NextRequest) {
             '/api/auth/login': {
                 post: {
                     tags: ['Auth'],
-                    summary: 'Login',
+                    summary: 'Start login (OTP-only)',
                     requestBody: {
                         required: true,
                         content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginRequest' } } },
                     },
                     responses: {
-                        '200': { description: 'JWT token returned', content: { 'application/json': { schema: { $ref: '#/components/schemas/LoginResponse' } } } },
-                        '401': { description: 'Invalid credentials' },
+                        '202': { description: 'OTP initiated', content: { 'application/json': { schema: { $ref: '#/components/schemas/OTPFlowResponse' } } } },
+                        '401': { description: 'Unauthorized: token not involved in this endpoint' },
+                        '410': { description: 'Legacy password payload rejected' },
+                    },
+                },
+            },
+            '/api/auth/register': {
+                post: {
+                    tags: ['Auth'],
+                    summary: 'Start registration/login via email (OTP-only)',
+                    requestBody: {
+                        required: true,
+                        content: { 'application/json': { schema: { $ref: '#/components/schemas/RegisterRequest' } } },
+                    },
+                    responses: {
+                        '202': { description: 'OTP initiated or register intent returned', content: { 'application/json': { schema: { $ref: '#/components/schemas/OTPFlowResponse' } } } },
+                        '410': { description: 'Legacy password payload rejected' },
                     },
                 },
             },
@@ -199,18 +214,27 @@ export async function GET(request: NextRequest) {
             schemas: {
                 LoginRequest: {
                     type: 'object',
-                    required: ['email', 'password'],
+                    required: ['email'],
                     properties: {
                         email: { type: 'string', format: 'email' },
-                        password: { type: 'string', minLength: 8 },
                     },
                 },
-                LoginResponse: {
+                RegisterRequest: {
+                    type: 'object',
+                    required: ['email'],
+                    properties: {
+                        email: { type: 'string', format: 'email' },
+                        name: { type: 'string', minLength: 1 },
+                        role: { type: 'string', enum: ['AFFILIATE', 'ADMIN'], description: 'Public register flow treats non-AFFILIATE as AFFILIATE' },
+                    },
+                },
+                OTPFlowResponse: {
                     type: 'object',
                     properties: {
                         success: { type: 'boolean' },
-                        token: { type: 'string' },
-                        user: { $ref: '#/components/schemas/UserSummary' },
+                        next: { type: 'string', enum: ['otp', 'register'] },
+                        email: { type: 'string', format: 'email' },
+                        message: { type: 'string' },
                     },
                 },
                 UserSummary: {

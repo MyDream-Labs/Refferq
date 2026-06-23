@@ -413,7 +413,7 @@ export default function ReportsPage() {
                         <span className="font-medium">
                           {typeof v === 'number'
                             ? k.toLowerCase().includes('cents')
-                              ? `₹${(v / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`
+                              ? `$${(v / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`
                               : v.toLocaleString()
                             : String(v)}
                         </span>
@@ -433,7 +433,7 @@ export default function ReportsPage() {
                 <p className="text-2xl font-bold">
                   {typeof value === 'number'
                     ? key.toLowerCase().includes('cents')
-                      ? `₹${(value / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`
+                      ? `$${(value / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`
                       : value.toLocaleString()
                     : String(value)}
                 </p>
@@ -468,7 +468,7 @@ export default function ReportsPage() {
                   let display: string;
                   if (val === null || val === undefined) display = '—';
                   else if (typeof val === 'number' && col.toLowerCase().includes('cents'))
-                    display = `₹${(val / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+                    display = `$${(val / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
                   else if (typeof val === 'number') display = val.toLocaleString();
                   else display = String(val);
                   return <TableCell key={col} className="text-sm whitespace-nowrap">{display}</TableCell>;
@@ -903,10 +903,10 @@ export default function ReportsPage() {
                             <TableCell className="text-right">{c.conversionRate}%</TableCell>
                             <TableCell className="text-right">{c.totalCommissions}</TableCell>
                             <TableCell className="text-right font-medium">
-                              ₹{(c.totalEarningsCents / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                              ${(c.totalEarningsCents / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
                             </TableCell>
                             <TableCell className="text-right text-muted-foreground">
-                              ₹{(c.avgEarningsPerAffiliateCents / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                              ${(c.avgEarningsPerAffiliateCents / 100).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
                             </TableCell>
                           </TableRow>
                         ))}

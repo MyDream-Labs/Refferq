@@ -2,17 +2,17 @@ import { NextRequest, NextResponse } from 'next/server';
 import { otpService } from '@/lib/otp';
 import { SignJWT } from 'jose';
 import { checkRateLimit } from '@/lib/rate-limit';
+import { getJwtExpiration, getJwtCookieMaxAgeSeconds, getJwtSecret } from '@/lib/auth-config';
+import { extractRequestIp, normalizeEmail } from '@/lib/auth-flow';
 
-const JWT_SECRET = new TextEncoder().encode(
-  process.env.JWT_SECRET!
-);
+const JWT_SECRET = getJwtSecret();
+const JWT_EXPIRATION = getJwtExpiration();
+const JWT_COOKIE_AGE = getJwtCookieMaxAgeSeconds();
 
 export async function POST(request: NextRequest) {
   try {
     // Rate limit: 5 verify attempts per minute per IP
-    const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
-      || request.headers.get('x-real-ip')
-      || 'unknown';
+    const ip = extractRequestIp(request);
     const rateLimit = await checkRateLimit(ip, 'auth/verify-otp', 5, 60 * 1000);
     if (!rateLimit.allowed) {
       return NextResponse.json(
@@ -21,7 +21,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const { email, code } = await request.json();
+    const body = (await request.json()) as Record<string, unknown>;
+    const email = normalizeEmail(body.email);
+    const code = typeof body.code === 'string' ? body.code.trim() : '';
 
     if (!email || !code) {
       return NextResponse.json(
@@ -41,6 +43,20 @@ export async function POST(request: NextRequest) {
 
     const user = result.user!;
 
+    if (user.status === 'INACTIVE' || user.status === 'SUSPENDED') {
+      return NextResponse.json(
+        { error: 'Your account is not active. Please contact support.' },
+        { status: 403 }
+      );
+    }
+
+    if (user.status === 'PENDING' && user.role !== 'ADMIN') {
+      return NextResponse.json(
+        { error: 'Account is pending approval. Please contact support if activation is needed.' },
+        { status: 403 }
+      );
+    }
+
     // Generate JWT token
     const token = await new SignJWT({
       userId: user.id,
@@ -50,7 +66,7 @@ export async function POST(request: NextRequest) {
     })
       .setProtectedHeader({ alg: 'HS256' })
       .setIssuedAt()
-      .setExpirationTime('24h')
+      .setExpirationTime(JWT_EXPIRATION)
       .sign(JWT_SECRET);
 
     // Set cookie
@@ -70,7 +86,7 @@ export async function POST(request: NextRequest) {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 86400, // 24 hours
+      maxAge: JWT_COOKIE_AGE,
       path: '/'
     });
 

@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { jwtVerify } from 'jose';
+import { prisma } from '@/lib/prisma';
+import { getJwtSecret } from '@/lib/auth-config';
 
-const JWT_SECRET = new TextEncoder().encode(
-    process.env.JWT_SECRET!
-);
+const JWT_SECRET = getJwtSecret();
 
 export async function middleware(request: NextRequest) {
     const { pathname } = request.nextUrl;
@@ -36,8 +36,47 @@ export async function middleware(request: NextRequest) {
 
     try {
         // 3. Verify JWT
-        const { payload } = await jwtVerify(token, JWT_SECRET);
-        const userRole = payload.role as string;
+        const { payload } = await jwtVerify(token, JWT_SECRET, {
+            algorithms: ['HS256'],
+        });
+        const userId = payload.userId as string | undefined;
+
+        if (!userId) {
+            if (pathname.startsWith('/api/')) {
+                return NextResponse.json(
+                    { error: 'Invalid or expired token' },
+                    { status: 401 }
+                );
+            }
+            return NextResponse.redirect(new URL('/login', request.url));
+        }
+
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { id: true, role: true, status: true },
+        });
+
+        if (!user) {
+            if (pathname.startsWith('/api/')) {
+                return NextResponse.json(
+                    { error: 'Invalid or expired token' },
+                    { status: 401 }
+                );
+            }
+            return NextResponse.redirect(new URL('/login', request.url));
+        }
+
+        if (user.status !== 'ACTIVE') {
+            if (pathname.startsWith('/api/')) {
+                return NextResponse.json(
+                    { error: 'Account is inactive or pending approval' },
+                    { status: 403 }
+                );
+            }
+            return NextResponse.redirect(new URL('/login', request.url));
+        }
+
+        const userRole = user.role as string;
 
         // 4. Role-based access control
         if (isAdminRoute && userRole !== 'ADMIN') {
@@ -62,8 +101,9 @@ export async function middleware(request: NextRequest) {
 
         // 5. Inject user info into request headers for API usage
         const requestHeaders = new Headers(request.headers);
-        requestHeaders.set('x-user-id', payload.userId as string);
+        requestHeaders.set('x-user-id', user.id);
         requestHeaders.set('x-user-role', userRole);
+        requestHeaders.set('x-user-status', user.status);
 
         return NextResponse.next({
             request: {
